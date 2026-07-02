@@ -1,4 +1,4 @@
-Good — let's build this practically in K8s now. I'll walk you through verification at every stage so you know exactly what to check.
+Good — let's build this practically in K8s now. I'll walk you through verification at every stage so you know exactly what to check
 
 ---
 
