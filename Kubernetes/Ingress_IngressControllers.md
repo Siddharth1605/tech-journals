@@ -1,6 +1,6 @@
 # Ingress & Ingress Controllers — Architecture Notes
 
-> Companion to `kubernetes-internals-notes.md`. Focus: Ingress as an API object vs. Ingress Controller as the thing that actually does work, the two ways it gets deployed in front of real traffic, and where TLS and non-HTTP traffic fit in.
+> Companion to `kubernetes-internals-notes.md`. Focus: Ingress as an API object vs Ingress Controller as the thing that actually does work, the two ways it gets deployed in front of real traffic, and where TLS and non-HTTP traffic fit in.
 
 ---
 
