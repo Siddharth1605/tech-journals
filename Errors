@@ -1,6 +1,0 @@
-kubectl logs calico-node-lxmhg -n kube-system --tail=50 | grep -iE "error|warn|fail"
-Defaulted container "calico-node" out of: calico-node, upgrade-ipam (init), install-cni (init), mount-bpffs (init)
-2026-07-14 09:14:49.577 [INFO][77] felix/endpoint_mgr.go 490: Re-evaluated workload endpoint status adminUp=true failed=false known=true operUp=true status="up" workloadEndpointID=proto.WorkloadEndpointID{OrchestratorId:"k8s", WorkloadId:"default/fws-ac-mqtt-86cfbd7685-mxcsd", EndpointId:"eth0"}
-2026-07-14 09:14:51.063 [INFO][77] felix/endpoint_mgr.go 490: Re-evaluated workload endpoint status adminUp=false failed=false known=false operUp=false status="" workloadEndpointID=proto.WorkloadEndpointID{OrchestratorId:"k8s", WorkloadId:"default/fws-ac-mqtt-86cfbd7685-mxcsd", EndpointId:"eth0"}
-2026-07-14 09:14:51.064 [INFO][77] felix/route_table.go 1185: Failed to access interface because it doesn't exist. error=Link not found ifaceName="cali4a9cc8d1c56" ifaceRegex="^cali.*" ipVersion=0x4 tableIndex=254
-2026-07-14 09:14:51.064 [INFO][77] felix/route_table.go 1253: Failed to get interface; it's down/gone. error=Link not found ifaceName="cali4a9cc8d1c56" ifaceRegex="^cali.*" ipVersion=0x4 tableIndex=254
