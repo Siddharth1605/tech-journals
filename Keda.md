@@ -1,6 +1,6 @@
 Yes, avi. That command only waits for Kafka to become ready. It does not build or deploy the producer and consumer. Right now, don’t continue until Kafka becomes 1/1 Running.
 
-Your full flow should be
+
 
 KEDA installed
       ↓
