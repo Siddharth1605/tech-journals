@@ -1,0 +1,55 @@
+[retfusion@mt-star-k8s-master kafka-keda]$ kubectl exec -it deploy/redpanda -n keda-scaling -- rpk group describe orders-group --brokers redpanda:9092
+GROUP        orders-group
+COORDINATOR  0
+STATE        PreparingRebalance
+BALANCER
+MEMBERS      5
+TOTAL-LAG    0
+[retfusion@mt-star-k8s-master kafka-keda]$ kubectl -n keda-scaling get scaledobject
+NAME                     SCALETARGETKIND      SCALETARGETNAME   MIN   MAX   READY   ACTIVE   FALLBACK   PAUSED   TRIGGERS   AUTHENTICATIONS   AGE
+orders-consumer-scaler   apps/v1.Deployment   orders-consumer   1     5     True    True     False      False    kafka                        110m
+[retfusion@mt-star-k8s-master kafka-keda]$ kubectl -n keda-scaling get hpa
+NAME                              REFERENCE                    TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+keda-hpa-orders-consumer-scaler   Deployment/orders-consumer   10/10 (avg)   1         5         5          111m
+[retfusion@mt-star-k8s-master kafka-keda]$ kubectl -n keda-scaling get hpa keda-hpa-orders-consumer-scaler
+NAME                              REFERENCE                    TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+keda-hpa-orders-consumer-scaler   Deployment/orders-consumer   10/10 (avg)   1         5         5          112m
+[retfusion@mt-star-k8s-master kafka-keda]$ kubectl describe hpa keda-hpa-orders-consumer-scaler -n keda-scaling
+Name:                                        keda-hpa-orders-consumer-scaler
+Namespace:                                   keda-scaling
+Labels:                                      app.kubernetes.io/managed-by=keda-operator
+                                             app.kubernetes.io/name=keda-hpa-orders-consumer-scaler
+                                             app.kubernetes.io/part-of=orders-consumer-scaler
+                                             app.kubernetes.io/version=2.20.1
+                                             scaledobject.keda.sh/name=orders-consumer-scaler
+Annotations:                                 <none>
+CreationTimestamp:                           Sat, 25 Jul 2026 14:34:34 +0530
+Reference:                                   Deployment/orders-consumer
+Metrics:                                     ( current / target )
+  "s0-kafka-orders" (target average value):  10 / 10
+Min replicas:                                1
+Max replicas:                                5
+Behavior:
+  Scale Up:
+    Stabilization Window: 0 seconds
+    Select Policy: Max
+    Policies:
+      - Type: Pods     Value: 4    Period: 15 seconds
+      - Type: Percent  Value: 100  Period: 15 seconds
+  Scale Down:
+    Stabilization Window: 15 seconds
+    Select Policy: Max
+    Policies:
+      - Type: Percent  Value: 100  Period: 15 seconds
+Deployment pods:       5 current / 5 desired
+Conditions:
+  Type            Status  Reason              Message
+  ----            ------  ------              -------
+  AbleToScale     True    ReadyForNewScale    recommended size matches current size
+  ScalingActive   True    ValidMetricFound    the HPA was able to successfully calculate a replica count from external metric s0-kafka-orders(&LabelSelector{MatchLabels:map[string]string{scaledobject.keda.sh/name: orders-consumer-scaler,},MatchExpressions:[]LabelSelectorRequirement{},})
+  ScalingLimited  False   DesiredWithinRange  the desired count is within the acceptable range
+Events:
+  Type     Reason             Age                    From                       Message
+  ----     ------             ----                   ----                       -------
+  Warning  FailedGetScale     9m7s (x313 over 110m)  horizontal-pod-autoscaler  deployments/scale.apps "orders-consumer" not found
+  Normal   SuccessfulRescale  5m3s (x4 over 37m)     horizontal-pod-autoscaler  New size: 5; reason: external metric s0-kafka-orders(&LabelSelector{MatchLabels:map[string]string{scaledobject.keda.sh/name: orders-consumer-scaler,},MatchExpressions:[]LabelSelectorRequirement{},}) above target
