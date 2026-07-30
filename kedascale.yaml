@@ -6,7 +6,7 @@ metadata:
 
 spec:
   scaleTargetRef:
-    name: orders-consumer
+    name: orders-consumers
 
   pollingInterval: 5          # ADDED: check lag every 5s instead of the 30s default
 
