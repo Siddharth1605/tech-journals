@@ -1,6 +1,5 @@
 # Spring Boot — Complete Interview Guide (1.5 YOE)
 
-> Format per topic: **What it is → Diagram → Why interviewers ask → Q&A**
 
 ---
 
