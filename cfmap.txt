@@ -1,0 +1,6 @@
+NAME                       DATA   AGE
+fluent-bit                 2      139m
+kube-root-ca.crt           1      164m
+logging-es-scripts         6      160m
+logging-es-unicast-hosts   1      160m
+logging-kb-scripts         1      153m

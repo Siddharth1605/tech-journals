@@ -1,0 +1,7 @@
+NAME                       TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)          AGE
+fluent-bit                 ClusterIP   10.109.85.45     <none>        2020/TCP         139m
+logging-es-default         ClusterIP   None             <none>        9200/TCP         160m
+logging-es-http            ClusterIP   10.111.202.159   <none>        9200/TCP         160m
+logging-es-internal-http   ClusterIP   10.108.26.166    <none>        9200/TCP         160m
+logging-es-transport       ClusterIP   None             <none>        9300/TCP         160m
+logging-kb-http            NodePort    10.96.254.185    <none>        5601:30753/TCP   146m
