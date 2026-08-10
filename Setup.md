@@ -1,708 +1,250 @@
-Yep. Let's do this cleanly, and this time no giant mysterious values.yaml. We'll build it in layers and verify each layer before touching the next.
 
-One correction to what I said earlier: for a current Elastic installation, I actually do recommend ECK even for your lab. Elastic's old standalone elasticsearch/kibana Helm charts stopped at 8.5.1, while ECK is the currently supported Kubernetes management path. 
-
-For your one-node lab, we'll use:
-
-1 Kubernetes node
-1 Elasticsearch pod
-1 Kibana pod
-1 Fluent Bit pod
-local-path PVC
-NO Logstash
-NO Lua initially
-NO dynamic indices initially
-NO Merge_Log initially
-
-The target is:
-
-Test Pod
-   │
-   │ stdout
-   ▼
-/var/log/containers/*.log
-   │
-   ▼
-Fluent Bit
-   │
-   │ HTTPS
-   ▼
-Elasticsearch
-   │
-   ▼
-Kibana
-
-Fluent Bit's official Kubernetes guidance also uses a DaemonSet to collect /var/log/containers/*.log and enrich records with Kubernetes metadata. 
-
-
----
-
-Phase 0 — Clean the old lab
-
-Do this first.
-
-See what currently exists:
-
-helm list -A
-
-Then:
-
-kubectl get pods -A | grep -Ei 'fluent|elastic|kibana|logstash'
-
-And:
-
-kubectl get pvc -A
-
-If this is genuinely a disposable logging lab, you can remove the old logging namespace:
-
-kubectl delete namespace logging
-
-If your old installation used another namespace, delete that namespace instead.
-
-Then verify:
-
-kubectl get pods -A | grep -Ei 'fluent|elastic|kibana|logstash'
-
-Also check Helm:
-
-helm list -A
-
-Don't delete CRDs yet. We'll handle ECK cleanly below.
-
-
----
-
-Phase 1 — Create our logging namespace
-
-kubectl create namespace logging
-
-
----
-
-Phase 2 — Install ECK
-
-Add Elastic's official Helm repository:
-
-helm repo add elastic https://helm.elastic.co
-helm repo update
-
-Elastic documents this repository and the eck-operator Helm chart officially. 
-
-Install the operator:
-
-helm upgrade --install elastic-operator \
-  elastic/eck-operator \
-  --namespace elastic-system \
-  --create-namespace
-
-Check:
-
-kubectl get pods -n elastic-system
-
-You want:
-
-elastic-operator-xxxxx   1/1   Running
-
-Don't proceed until that's running.
-
-
----
-
-Phase 3 — Elasticsearch
-
-Now create one Elasticsearch node.
-
-Create:
-
-cat <<'EOF' | kubectl apply -f -
-apiVersion: elasticsearch.k8s.elastic.co/v1
-kind: Elasticsearch
-metadata:
-  name: logging
-  namespace: logging
-spec:
-  version: 9.4.3
-  nodeSets:
-    - name: default
-      count: 1
-      config:
-        node.store.allow_mmap: false
-      volumeClaimTemplates:
-        - metadata:
-            name: elasticsearch-data
-          spec:
-            storageClassName: local-path
-            accessModes:
-              - ReadWriteOnce
-            resources:
-              requests:
-                storage: 10Gi
-EOF
-
-I'm deliberately using 9.4.3 here rather than latest, so Elasticsearch and Kibana are pinned to the same version.
-
-ECK's official single-node deployment follows this same basic model: one node and node.store.allow_mmap: false for a simple Kubernetes quickstart. 
-
-Check:
-
-kubectl get elasticsearch -n logging
-
-Initially you may see:
-
-HEALTH   PHASE
-         ApplyingChanges
-
-Wait:
-
-kubectl get pods -n logging -w
-
-Eventually:
-
-logging-es-default-0   1/1   Running
-
-Then:
-
-kubectl get elasticsearch -n logging
-
-You want:
-
-logging   green   1   9.4.3   Ready
-
-Check the PVC
-
-kubectl get pvc -n logging
-
-You should see something like:
-
-elasticsearch-data-logging-es-default-0   Bound   10Gi   RWO   local-path
-
-This confirms we're actually using your local-path storage.
-
-
----
-
-Phase 4 — Test Elasticsearch BEFORE Kibana
-
-This is important.
-
-Don't install everything and then wonder what's broken.
-
-Get the Elasticsearch password:
-
-export ELASTIC_PASSWORD=$(kubectl get secret logging-es-elastic-user \
-  -n logging \
-  -o go-template='{{.data.elastic | base64decode}}')
-
-Check:
-
-echo "$ELASTIC_PASSWORD"
-
-Now port-forward:
-
-kubectl port-forward -n logging service/logging-es-http 9200:9200
-
-Leave that terminal running.
-
-Open another terminal:
-
-curl -k -u "elastic:$ELASTIC_PASSWORD" https://localhost:9200
-
-You should get JSON containing something like:
-
-{
-  "name": "...",
-  "cluster_name": "logging",
-  "version": {
-    "number": "9.4.3"
-  }
-}
-
-If this works:
-
-Elasticsearch is DONE.
-
-Don't touch Fluent Bit yet.
-
-
----
-
-Phase 5 — Kibana
-
-Now create Kibana:
-
-cat <<'EOF' | kubectl apply -f -
-apiVersion: kibana.k8s.elastic.co/v1
-kind: Kibana
-metadata:
-  name: logging
-  namespace: logging
-spec:
-  version: 9.4.3
-  count: 1
-  elasticsearchRef:
-    name: logging
-EOF
-
-This is the standard ECK pattern: Kibana references the Elasticsearch resource using elasticsearchRef. 
-
-Check:
-
-kubectl get kibana -n logging
-
-And:
-
-kubectl get pods -n logging
-
-Wait until:
-
-logging-kb-xxxxx   1/1   Running
-
-Then:
-
-kubectl port-forward -n logging service/logging-kb-http 5601:5601
-
-Open:
-
-https://localhost:5601
-
-Get the password:
-
-kubectl get secret logging-es-elastic-user \
-  -n logging \
-  -o=jsonpath='{.data.elastic}' | base64 --decode
-
-ECK automatically creates the elastic credentials in a Secret. 
-
-Login:
-
-Username: elastic
-Password: <password>
-
-Kibana working?
-
-Great.
-
-At this point:
-
-✅
-         Elasticsearch
-                ▲
-                │
-             Kibana
-
-But there are no logs yet.
-
-
----
-
-Phase 6 — Install Fluent Bit
-
-Now we add the final piece.
-
-Add the official Fluent Bit Helm repository:
-
-helm repo add fluent https://fluent.github.io/helm-charts
-helm repo update
-
-The Fluent Bit documentation specifically recommends its official Helm chart for Kubernetes deployments. 
-
-We're going to create a minimal configuration.
-
-Create fluent-bit-values.yaml:
-
-kind: DaemonSet
-
-config:
-  service: |
-    [SERVICE]
-        Daemon Off
-        Flush 1
-        Log_Level info
-        Parsers_File /fluent-bit/etc/parsers.conf
-        HTTP_Server On
-        HTTP_Listen 0.0.0.0
-        HTTP_Port 2020
-
-  inputs: |
-    [INPUT]
-        Name tail
-        Path /var/log/containers/*.log
-        multiline.parser docker, cri
-        Tag kube.*
-        Mem_Buf_Limit 20MB
-        Skip_Long_Lines On
-        DB /var/log/flb_kubernetes.db
-
-  filters: |
-    [FILTER]
-        Name kubernetes
-        Match kube.*
-        Merge_Log Off
-        Keep_Log On
-
-  outputs: |
-    [OUTPUT]
-        Name es
-        Match kube.*
-        Host logging-es-http.logging.svc
-        Port 9200
-        HTTP_User elastic
-        HTTP_Passwd ${ELASTIC_PASSWORD}
-        tls On
-        tls.verify Off
-        Suppress_Type_Name On
-        Logstash_Format On
-        Logstash_Prefix logstash
-        Retry_Limit False
-
-daemonSetVolumes:
-  - name: varlog
-    hostPath:
-      path: /var/log
-
-daemonSetVolumeMounts:
-  - name: varlog
-    mountPath: /var/log
-
-env:
-  - name: ELASTIC_PASSWORD
-    valueFrom:
-      secretKeyRef:
-        name: logging-es-elastic-user
-        key: elastic
-
-Important
-
-Notice what is NOT here:
-
-❌ Lua
-❌ custom parser
-❌ namespace routing
-❌ es_index
-❌ Logstash_Prefix_Key
-❌ XML parser
-❌ JSON parser
-❌ Merge_Log On
-❌ complex filters
-
-We're intentionally making Fluent Bit boring.
-
-The official Fluent Bit Elasticsearch output supports HTTP_User, HTTP_Passwd, TLS, Logstash_Format, and indefinite retries. 
-
-Install:
-
-helm upgrade --install fluent-bit \
-  fluent/fluent-bit \
-  --namespace logging \
-  --values fluent-bit-values.yaml
-
-Check:
-
-kubectl get pods -n logging
-
-You should now have approximately:
-
-logging-es-default-0       1/1 Running
-logging-kb-xxxxx            1/1 Running
-fluent-bit-xxxxx            1/1 Running
-
-Because Fluent Bit is a DaemonSet, one pod is exactly what we expect on your one-node cluster. 
-
-
----
-
-Phase 7 — Don't test with your real application yet
-
-Let's use a ridiculously simple test.
-
-kubectl create namespace logging-test
-
-Create:
-
-cat <<'EOF' | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: log-generator
-  namespace: logging-test
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: log-generator
-  template:
-    metadata:
-      labels:
-        app: log-generator
-    spec:
-      containers:
-        - name: logger
-          image: busybox:1.36
-          command:
-            - sh
-            - -c
-            - |
-              i=0
-              while true; do
-                echo "HELLO FROM LOGGING TEST - message=$i namespace=logging-test"
-                i=$((i+1))
-                sleep 2
-              done
-EOF
-
-Check:
-
-kubectl logs -n logging-test deployment/log-generator
-
-You should see:
-
-HELLO FROM LOGGING TEST - message=0 namespace=logging-test
-HELLO FROM LOGGING TEST - message=1 namespace=logging-test
-HELLO FROM LOGGING TEST - message=2 namespace=logging-test
-
-
----
-
-Phase 8 — Check Fluent Bit
-
-kubectl logs -n logging -l app.kubernetes.io/name=fluent-bit --tail=100
-
-You should not see:
-
-failed to flush chunk
-retrying
-
-If you do, STOP HERE.
-
-Don't touch Kibana.
-
-We troubleshoot Fluent Bit → Elasticsearch.
-
-
----
-
-Phase 9 — Check Elasticsearch
-
-Port-forward is already available if you left it running:
-
-curl -k -u "elastic:$ELASTIC_PASSWORD" \
-  "https://localhost:9200/_cat/indices?v"
-
-You should see something resembling:
-
-health status index
-green  open   logstash-2026.08.10
-
-Then:
-
-curl -k -u "elastic:$ELASTIC_PASSWORD" \
-  "https://localhost:9200/logstash-*/_search?pretty"
-
-You should find:
-
-HELLO FROM LOGGING TEST
-
-If you see that:
-
-🎉 Fluent Bit → Elasticsearch works.
-
-
----
-
-Phase 10 — Kibana
-
-Go to Kibana:
-
-https://localhost:5601
-
-Create a Data View:
-
-logstash-*
-
-Use:
-
-@timestamp
-
-as the time field.
-
-Search:
-
-namespace_name : "logging-test"
-
-You should see the messages.
-
-
----
-
-Phase 11 — NOW test your real application
-
-Only now deploy your actual application.
-
-And don't modify Fluent Bit.
-
-Your application can produce:
-
-JSON
-XML
-<entry>
-   ...
-</entry>
-
-etc.
-
-With:
-
-Merge_Log Off
-Keep_Log On
-
-Fluent Bit will initially treat the application payload as a log value rather than trying to merge it into the Kubernetes record.
-
-That is exactly what we want for the first test.
-
-If:
-
-kubectl logs
-       ↓
-Fluent Bit
-       ↓
-Elasticsearch
-       ↓
-Kibana
-
-works for the simple test but fails for your application, then we know the problem is actually associated with your application's log records.
-
-That's a dramatically better debugging position than where we are now.
-
-
----
-
-After everything works: namespace indices
-
-Only then do we add your requirement:
-
-abhishek-namespace-a-2026.08.10
-abhishek-namespace-b-2026.08.10
-abhishek-namespace-c-2026.08.10
-
-And we don't even need your Lua script necessarily.
-
-Fluent Bit's Elasticsearch output supports:
-
-Logstash_Prefix_Key
-
-which can use a record field such as kubernetes.namespace_name to determine the index prefix. 
-
-So we can eventually do:
-
-Logstash_Format On
-Logstash_Prefix logstash
-Logstash_Prefix_Key kubernetes['namespace_name']
-
-rather than maintaining Lua just to construct an index name.
-
-But don't add this yet.
-
-
----
-
-Complete uninstall
-
-This is the other thing you specifically asked for.
-
-When you want to destroy the lab:
-
-1. Remove Fluent Bit
-
-helm uninstall fluent-bit -n logging
-
-2. Remove Kibana
-
-kubectl delete kibana logging -n logging
-
-3. Remove Elasticsearch
-
-kubectl delete elasticsearch logging -n logging
-
-Wait:
-
-kubectl get pods -n logging
-
-Then remove the PVC:
-
-kubectl delete pvc -n logging --all
-
-Because you're using local-path, deleting the PVC is important if you want a genuinely fresh Elasticsearch installation.
-
-4. Remove ECK
-
-helm uninstall elastic-operator -n elastic-system
-
-Then:
-
-kubectl delete namespace elastic-system
-
-For a completely disposable lab, you can then remove ECK CRDs:
-
-kubectl get crd | grep k8s.elastic.co
-
-and delete the ECK CRDs if you're sure no other Elastic workloads use them.
-
-5. Remove logging namespace
-
-kubectl delete namespace logging
-kubectl delete namespace logging-test
-
-
----
-
-One important change from your previous setup
-
-Your old configuration had:
-
-Fluent Bit
-   ↓
-Kubernetes filter
-   ↓
-Lua
-   ↓
-dynamic es_index
-   ↓
-Logstash_Format
-   ↓
-Elasticsearch
-
-We're going to establish:
-
-Fluent Bit
-   ↓
-Kubernetes filter
-   ↓
-Elasticsearch
-
-First.
-
-Then:
-
-working pipeline
-       ↓
-namespace indices
-       ↓
-multiline
-       ↓
-application-specific parsing
-
-one piece at a time.
-
-That way, if "failed to flush chunk" comes back, we know exactly which change introduced it instead of spending another three days playing Helm-config whack-a-mole.
-
-One prerequisite
-
-Before you execute Phase 2, check:
-
-kubectl version
-helm version
-kubectl get storageclass
-
-Your local-path should show as the available StorageClass. Also make sure the single node has roughly 2 GiB or more of free memory for Elasticsearch; Elastic explicitly notes that insufficient free memory can leave a one-node Elasticsearch pod Pending. 
-
-If those checks are fine, start at Phase 0 and do this sequentially. Don't jump ahead.
+[2026/08/10 10:26:52.081] [ warn] [engine] failed to flush chunk '1-1786357605.15463348.flb', retry in 20 seconds: task_id=67, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:53.079] [ warn] [engine] failed to flush chunk '1-1786357613.17245906.flb', retry in 9 seconds: task_id=72, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:54.080] [ warn] [engine] failed to flush chunk '1-1786357557.10303801.flb', retry in 42 seconds: task_id=37, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:54.080] [ warn] [engine] failed to flush chunk '1-1786357595.14473652.flb', retry in 7 seconds: task_id=63, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:54.081] [ warn] [engine] failed to flush chunk '1-1786357575.13085814.flb', retry in 59 seconds: task_id=48, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:54.082] [ warn] [engine] failed to flush chunk '1-1786357493.149213910.flb', retry in 133 seconds: task_id=16, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:54.084] [ warn] [engine] failed to flush chunk '1-1786357613.161458378.flb', retry in 9 seconds: task_id=73, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:55.079] [ warn] [engine] failed to flush chunk '1-1786357589.13825673.flb', retry in 21 seconds: task_id=36, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:55.080] [ warn] [engine] failed to flush chunk '1-1786357615.20895260.flb', retry in 8 seconds: task_id=75, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:56.081] [ warn] [engine] failed to flush chunk '1-1786357610.39175625.flb', retry in 6 seconds: task_id=71, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:56.081] [ warn] [engine] failed to flush chunk '1-1786357607.15625809.flb', retry in 18 seconds: task_id=68, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:57.080] [ warn] [engine] failed to flush chunk '1-1786357609.15707356.flb', retry in 16 seconds: task_id=69, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:57.080] [ warn] [engine] failed to flush chunk '1-1786357617.19125430.flb', retry in 7 seconds: task_id=74, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:57.080] [ warn] [engine] failed to flush chunk '1-1786357591.14109568.flb', retry in 66 seconds: task_id=58, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:58.080] [ warn] [engine] failed to flush chunk '1-1786357611.16101471.flb', retry in 17 seconds: task_id=70, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:59.079] [ warn] [engine] failed to flush chunk '1-1786357444.908246443.flb', retry in 95 seconds: task_id=14, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:26:59.079] [ warn] [engine] failed to flush chunk '1-1786357619.21315226.flb', retry in 11 seconds: task_id=76, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:01.079] [ warn] [engine] failed to flush chunk '1-1786357561.10771289.flb', retry in 62 seconds: task_id=39, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:01.079] [ warn] [engine] failed to flush chunk '1-1786357595.32987625.flb', retry in 40 seconds: task_id=64, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:01.080] [ warn] [engine] failed to flush chunk '1-1786357577.12682807.flb', retry in 62 seconds: task_id=49, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:01.080] [ warn] [engine] failed to flush chunk '1-1786357565.20130881.flb', retry in 6 seconds: task_id=44, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:01.080] [ warn] [engine] failed to flush chunk '1-1786357571.11898733.flb', retry in 14 seconds: task_id=46, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:01.080] [ warn] [engine] failed to flush chunk '1-1786357595.14473652.flb', retry in 57 seconds: task_id=63, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:01.080] [ warn] [engine] failed to flush chunk '1-1786357621.23259818.flb', retry in 8 seconds: task_id=65, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:02.080] [ warn] [engine] failed to flush chunk '1-1786357613.17245906.flb', retry in 13 seconds: task_id=72, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:02.080] [ warn] [engine] failed to flush chunk '1-1786357610.39175625.flb', retry in 6 seconds: task_id=71, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:03.081] [ warn] [engine] failed to flush chunk '1-1786357504.992112406.flb', retry in 119 seconds: task_id=23, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:03.081] [ warn] [engine] failed to flush chunk '1-1786357615.20895260.flb', retry in 8 seconds: task_id=75, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:03.082] [ warn] [engine] failed to flush chunk '1-1786357536.83823806.flb', retry in 161 seconds: task_id=17, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:03.083] [ warn] [engine] failed to flush chunk '1-1786357623.23867179.flb', retry in 8 seconds: task_id=78, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:03.084] [ warn] [engine] failed to flush chunk '1-1786357613.161458378.flb', retry in 11 seconds: task_id=73, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:04.080] [ warn] [engine] failed to flush chunk '1-1786357579.12638719.flb', retry in 27 seconds: task_id=50, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:04.080] [ warn] [engine] failed to flush chunk '1-1786357617.19125430.flb', retry in 14 seconds: task_id=74, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:04.080] [ warn] [engine] failed to flush chunk '1-1786357593.14156128.flb', retry in 16 seconds: task_id=59, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:05.083] [ warn] [engine] failed to flush chunk '1-1786357625.23686501.flb', retry in 9 seconds: task_id=81, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:05.083] [ warn] [engine] failed to flush chunk '1-1786357625.44994294.flb', retry in 8 seconds: task_id=82, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:05.083] [ warn] [engine] failed to flush chunk '1-1786357624.908943448.flb', retry in 10 seconds: task_id=80, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:06.080] [ warn] [engine] failed to flush chunk '1-1786357603.15237837.flb', retry in 40 seconds: task_id=66, input=tail.0 > output=es.0 (out_id=0)
+[2026/08/10 10:27:06.080] [ warn] [engine] failed to flush chunk '1-1786357545.5606282.flb', retry in 108 seconds: task_id=30, input=tail.0 > output=es.0 (out_id=0)
+[retfusion@-k8s-master config3]$ kubectl logs -n logging -l app.kubernetes.io/name=fluent-bit --tail=200 | grep -Ei "error/warn/retry/flush/es/http"
+[retfusion@-k8s-master config3]$ kubectl get pods -n logging -o wide
+NAME                          READY   STATUS    RESTARTS   AGE     IP                NODE                 NOMINATED NODE   READINESS GATES
+fluent-bit-vtl9h              1/1     Running   0          9m50s   x.y.z.151   k8s-master   <none>           <none>
+logging-es-default-0          1/1     Running   0          30m     x.y.z.158   k8s-master   <none>           <none>
+logging-kb-6f787bcfbd-wbch4   1/1     Running   0          23m     x.y.z.144   k8s-master   <none>           <none>
+[retfusion@-k8s-master config3]$ kubectl logs -n logging logging-es-default-0 --tail=200
+Defaulted container "elasticsearch" out of: elasticsearch, elastic-internal-init-filesystem (init), elastic-internal-suspend (init)
+{"@timestamp":"2026-08-10T10:09:16.621Z","log.level": "INFO","message":"adding index template [.kibana-siem-dashboard-migrations-migrations] for index patterns [.kibana-siem-dashboard-migrations-migrations-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.624Z","log.level": "INFO","message":"adding index template [.kibana-siem-rule-migrations-prebuiltrules] for index patterns [.kibana-siem-rule-migrations-prebuiltrules]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.627Z","log.level": "INFO","message":"adding index template [.kibana-siem-rule-migrations-migrations] for index patterns [.kibana-siem-rule-migrations-migrations-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.629Z","log.level": "INFO","message":"adding index template [.kibana_locks-index-template] for index patterns [.kibana_locks*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.713Z","log.level": "INFO","message":"creating index [.apm-source-map] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.716Z","log.level": "INFO","message":"creating index [.kibana_security_session_1] in project [default], cause [api], templates [], shards [1]/[0]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.718Z","log.level": "INFO","message":"creating index [.kibana-siem-rule-migrations-prebuiltrules] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.721Z","log.level": "INFO","message":"creating index [.kibana_locks-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.721Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.apm-source-map, .kibana_locks-000001, .kibana-siem-rule-migrations-prebuiltrules]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.763Z","log.level": "INFO","message":"adding index template [.kibana-siem-dashboard-migrations-dashboards] for index patterns [.kibana-siem-dashboard-migrations-dashboards-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.798Z","log.level": "INFO","message":"adding index template [.kibana-data-quality-dashboard-results-index-template] for index patterns [.kibana-data-quality-dashboard-results-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.804Z","log.level": "INFO","message":"adding index template [.kibana-siem-rule-migrations-integrations] for index patterns [.kibana-siem-rule-migrations-integrations]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.809Z","log.level": "INFO","message":"adding index template [.kibana-event-log-template] for index patterns [.kibana-event-log-ds]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.940Z","log.level": "INFO","message":"creating index [.entity_analytics.watchlists.default] in project [default], cause [api], templates [], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.942Z","log.level": "INFO","message":"creating index [.kibana-siem-rule-migrations-integrations] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:16.943Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.kibana-siem-rule-migrations-integrations]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.148Z","log.level": "INFO","message":"adding component template [.slo-observability.sli-mappings-v3.6]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.150Z","log.level": "INFO","message":"adding component template [.slo-observability.summary-mappings-v3.6]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.151Z","log.level": "INFO","message":"adding component template [.slo-observability.summary-settings-v3.6]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.152Z","log.level": "INFO","message":"adding component template [.slo-observability.sli-settings-v3.6]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.154Z","log.level": "INFO","message":"adding component template [logs.ecs@stream.layer]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.156Z","log.level": "INFO","message":"adding index template [logs.ecs@stream] for index patterns [logs.ecs]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.158Z","log.level": "INFO","message":"adding component template [logs.otel@stream.layer]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.161Z","log.level": "INFO","message":"adding index template [logs.otel@stream] for index patterns [logs.otel]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.216Z","log.level": "INFO","message":"adding index template [.slo-observability.sli-v3.6] for index patterns [.slo-observability.sli-v3.6*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.241Z","log.level": "INFO","message":"creating index [.ds-.workflows-events-2026.08.10-000001] in project [default], cause [initialize_data_stream], templates [], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.243Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.ds-.workflows-events-2026.08.10-000001]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.245Z","log.level": "INFO","message":"adding data stream [.workflows-events] with write index [.ds-.workflows-events-2026.08.10-000001], backing indices [], and aliases []", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateDataStreamService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.274Z","log.level": "INFO","message":"adding index template [.slo-observability.summary-v3.6] for index patterns [.slo-observability.summary-v3.6*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.328Z","log.level": "INFO","message":"creating index [.slo-observability.sli-v3.6] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.329Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.slo-observability.sli-v3.6]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.433Z","log.level": "INFO","message":"creating index [.ds-.kibana-event-log-ds-2026.08.10-000001] in project [default], cause [initialize_data_stream], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.434Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.ds-.kibana-event-log-ds-2026.08.10-000001]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.434Z","log.level": "INFO","message":"adding data stream [.kibana-event-log-ds] with write index [.ds-.kibana-event-log-ds-2026.08.10-000001], backing indices [], and aliases []", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateDataStreamService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.503Z","log.level": "INFO","message":"creating index [.slo-observability.summary-v3.6] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.503Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.slo-observability.summary-v3.6]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.599Z","log.level": "INFO","message":"adding index lifecycle policy [entities_v1_history_ilm_policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.600Z","log.level": "INFO","message":"adding index lifecycle policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.600Z","log.level": "INFO","message":"adding index lifecycle policy [.preview.alerts-security.alerts-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.600Z","log.level": "INFO","message":"adding index lifecycle policy [kibana-reporting]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.631Z","log.level": "INFO","message":"creating index [.slo-observability.summary-v3.6.temp] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.632Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.slo-observability.summary-v3.6.temp]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.643Z","log.level": "INFO","message":"adding index template [.alerts-default.alerts-default-index-template] for index patterns [.internal.alerts-default.alerts-default-*, .reindexed-v8-internal.alerts-default.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#4]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.656Z","log.level": "INFO","message":"adding component template [kibana-reporting@custom]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.658Z","log.level": "INFO","message":"adding component template [.preview.alerts-security.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.659Z","log.level": "INFO","message":"adding component template [.alerts-stack.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.660Z","log.level": "INFO","message":"adding component template [.alerts-observability.threshold.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.661Z","log.level": "INFO","message":"adding component template [.alerts-ml.anomaly-detection.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.662Z","log.level": "INFO","message":"adding component template [.alerts-transform.health.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.663Z","log.level": "INFO","message":"adding component template [.alerts-streams.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.664Z","log.level": "INFO","message":"adding component template [.alerts-ml.anomaly-detection-health.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.665Z","log.level": "INFO","message":"adding component template [.alerts-security.attack.discovery.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.667Z","log.level": "INFO","message":"adding component template [.alerts-observability.uptime.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.668Z","log.level": "INFO","message":"adding component template [.alerts-observability.metrics.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.668Z","log.level": "INFO","message":"adding component template [.alerts-dataset.quality.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.670Z","log.level": "INFO","message":"adding component template [.alerts-observability.logs.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.673Z","log.level": "INFO","message":"adding component template [.alerts-security.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.675Z","log.level": "INFO","message":"adding component template [.alerts-observability.apm.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.676Z","log.level": "INFO","message":"adding component template [.alerts-observability.slo.alerts-mappings]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.678Z","log.level": "INFO","message":"adding index template [.alerts-default.alerts-default-index-template] for index patterns [.internal.alerts-default.alerts-default-*, .reindexed-v8-internal.alerts-default.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.719Z","log.level": "INFO","message":"adding index template [.alerts-ml.anomaly-detection-health.alerts-default-index-template] for index patterns [.internal.alerts-ml.anomaly-detection-health.alerts-default-*, .reindexed-v8-internal.alerts-ml.anomaly-detection-health.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#14]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.728Z","log.level": "INFO","message":"adding index template [.alerts-streams.alerts-default-index-template] for index patterns [.internal.alerts-streams.alerts-default-*, .reindexed-v8-internal.alerts-streams.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#9]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.728Z","log.level": "INFO","message":"adding index template [.alerts-ml.anomaly-detection.alerts-default-index-template] for index patterns [.internal.alerts-ml.anomaly-detection.alerts-default-*, .reindexed-v8-internal.alerts-ml.anomaly-detection.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#12]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.732Z","log.level": "INFO","message":"adding index template [.alerts-transform.health.alerts-default-index-template] for index patterns [.internal.alerts-transform.health.alerts-default-*, .reindexed-v8-internal.alerts-transform.health.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#5]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.734Z","log.level": "INFO","message":"adding index template [.alerts-observability.uptime.alerts-default-index-template] for index patterns [.internal.alerts-observability.uptime.alerts-default-*, .reindexed-v8-internal.alerts-observability.uptime.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#18]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.755Z","log.level": "INFO","message":"creating index [.internal.alerts-default.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.755Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.internal.alerts-default.alerts-default-000001]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.761Z","log.level": "INFO","message":"adding index template [.alerts-security.attack.discovery.alerts-default-index-template] for index patterns [.internal.alerts-security.attack.discovery.alerts-default-*, .reindexed-v8-internal.alerts-security.attack.discovery.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#2]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.771Z","log.level": "INFO","message":"adding index template [.alerts-dataset.quality.alerts-default-index-template] for index patterns [.internal.alerts-dataset.quality.alerts-default-*, .reindexed-v8-internal.alerts-dataset.quality.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#9]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.771Z","log.level": "INFO","message":"adding index template [.alerts-observability.threshold.alerts-default-index-template] for index patterns [.internal.alerts-observability.threshold.alerts-default-*, .reindexed-v8-internal.alerts-observability.threshold.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#20]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.773Z","log.level": "INFO","message":"adding index template [.alerts-stack.alerts-default-index-template] for index patterns [.internal.alerts-stack.alerts-default-*, .reindexed-v8-internal.alerts-stack.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#17]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.776Z","log.level": "INFO","message":"adding index template [.alerts-observability.metrics.alerts-default-index-template] for index patterns [.internal.alerts-observability.metrics.alerts-default-*, .reindexed-v8-internal.alerts-observability.metrics.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#14]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.779Z","log.level": "INFO","message":"adding index template [.alerts-observability.logs.alerts-default-index-template] for index patterns [.internal.alerts-observability.logs.alerts-default-*, .reindexed-v8-internal.alerts-observability.logs.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#11]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.789Z","log.level": "INFO","message":"adding index template [.alerts-ml.anomaly-detection.alerts-default-index-template] for index patterns [.internal.alerts-ml.anomaly-detection.alerts-default-*, .reindexed-v8-internal.alerts-ml.anomaly-detection.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.793Z","log.level": "INFO","message":"adding index template [.alerts-transform.health.alerts-default-index-template] for index patterns [.internal.alerts-transform.health.alerts-default-*, .reindexed-v8-internal.alerts-transform.health.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.793Z","log.level": "INFO","message":"adding index template [.alerts-security.alerts-default-index-template] for index patterns [.internal.alerts-security.alerts-default-*, .reindexed-v8-internal.alerts-security.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#18]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.830Z","log.level": "INFO","message":"adding index template [.alerts-observability.apm.alerts-default-index-template] for index patterns [.internal.alerts-observability.apm.alerts-default-*, .reindexed-v8-internal.alerts-observability.apm.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#11]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.864Z","log.level": "INFO","message":"adding index template [.alerts-observability.slo.alerts-default-index-template] for index patterns [.internal.alerts-observability.slo.alerts-default-*, .reindexed-v8-internal.alerts-observability.slo.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#11]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.918Z","log.level": "INFO","message":"adding index template [.alerts-security.attack.discovery.alerts-default-index-template] for index patterns [.internal.alerts-security.attack.discovery.alerts-default-*, .reindexed-v8-internal.alerts-security.attack.discovery.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.922Z","log.level": "INFO","message":"adding index template [.alerts-streams.alerts-default-index-template] for index patterns [.internal.alerts-streams.alerts-default-*, .reindexed-v8-internal.alerts-streams.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.940Z","log.level": "INFO","message":"adding index template [.alerts-dataset.quality.alerts-default-index-template] for index patterns [.internal.alerts-dataset.quality.alerts-default-*, .reindexed-v8-internal.alerts-dataset.quality.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.954Z","log.level": "INFO","message":"adding index template [.alerts-stack.alerts-default-index-template] for index patterns [.internal.alerts-stack.alerts-default-*, .reindexed-v8-internal.alerts-stack.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.970Z","log.level": "INFO","message":"adding index template [.alerts-observability.threshold.alerts-default-index-template] for index patterns [.internal.alerts-observability.threshold.alerts-default-*, .reindexed-v8-internal.alerts-observability.threshold.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.975Z","log.level": "INFO","message":"adding index template [.alerts-ml.anomaly-detection-health.alerts-default-index-template] for index patterns [.internal.alerts-ml.anomaly-detection-health.alerts-default-*, .reindexed-v8-internal.alerts-ml.anomaly-detection-health.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.991Z","log.level": "INFO","message":"adding index template [.alerts-observability.metrics.alerts-default-index-template] for index patterns [.internal.alerts-observability.metrics.alerts-default-*, .reindexed-v8-internal.alerts-observability.metrics.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:17.996Z","log.level": "INFO","message":"adding index template [.alerts-observability.uptime.alerts-default-index-template] for index patterns [.internal.alerts-observability.uptime.alerts-default-*, .reindexed-v8-internal.alerts-observability.uptime.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.013Z","log.level": "INFO","message":"adding index template [.alerts-security.alerts-default-index-template] for index patterns [.internal.alerts-security.alerts-default-*, .reindexed-v8-internal.alerts-security.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.027Z","log.level": "INFO","message":"adding index template [.alerts-observability.logs.alerts-default-index-template] for index patterns [.internal.alerts-observability.logs.alerts-default-*, .reindexed-v8-internal.alerts-observability.logs.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.031Z","log.level": "INFO","message":"adding index template [.alerts-observability.apm.alerts-default-index-template] for index patterns [.internal.alerts-observability.apm.alerts-default-*, .reindexed-v8-internal.alerts-observability.apm.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.047Z","log.level": "INFO","message":"adding index template [.alerts-observability.slo.alerts-default-index-template] for index patterns [.internal.alerts-observability.slo.alerts-default-*, .reindexed-v8-internal.alerts-observability.slo.alerts-default-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.075Z","log.level": "INFO","message":"creating index [.internal.alerts-transform.health.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.079Z","log.level": "INFO","message":"creating index [.internal.alerts-ml.anomaly-detection.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.080Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.internal.alerts-transform.health.alerts-default-000001, .internal.alerts-ml.anomaly-detection.alerts-default-000001]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.134Z","log.level": "INFO","message":"adding index template [.slo-observability.health-v3.6@template] for index patterns [.slo-observability.health-v3.6]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.204Z","log.level": "INFO","message":"creating index [.internal.alerts-stack.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.220Z","log.level": "INFO","message":"creating index [.internal.alerts-security.attack.discovery.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.224Z","log.level": "INFO","message":"creating index [.internal.alerts-observability.uptime.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.226Z","log.level": "INFO","message":"creating index [.internal.alerts-streams.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.241Z","log.level": "INFO","message":"creating index [.internal.alerts-security.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.255Z","log.level": "INFO","message":"creating index [.internal.alerts-observability.metrics.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.269Z","log.level": "INFO","message":"creating index [.internal.alerts-observability.threshold.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.272Z","log.level": "INFO","message":"creating index [.internal.alerts-ml.anomaly-detection-health.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.285Z","log.level": "INFO","message":"creating index [.internal.alerts-observability.logs.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.288Z","log.level": "INFO","message":"creating index [.internal.alerts-observability.apm.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.302Z","log.level": "INFO","message":"creating index [.internal.alerts-dataset.quality.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.316Z","log.level": "INFO","message":"creating index [.internal.alerts-observability.slo.alerts-default-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.318Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.internal.alerts-streams.alerts-default-000001, .internal.alerts-security.attack.discovery.alerts-default-000001, .internal.alerts-observability.metrics.alerts-default-000001, .internal.alerts-security.alerts-default-000001, .internal.alerts-observability.slo.alerts-default-000001, .internal.alerts-stack.alerts-default-000001, .internal.alerts-observability.uptime.alerts-default-000001, .internal.alerts-observability.threshold.alerts-default-000001, .internal.alerts-observability.logs.alerts-default-000001, .internal.alerts-observability.apm.alerts-default-000001, .internal.alerts-dataset.quality.alerts-default-000001, .internal.alerts-ml.anomaly-detection-health.alerts-default-000001]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.606Z","log.level": "INFO","message":"creating index [.ds-.slo-observability.health-v3.6-2026.08.10-000001] in project [default], cause [initialize_data_stream], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.606Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.ds-.slo-observability.health-v3.6-2026.08.10-000001]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.607Z","log.level": "INFO","message":"adding data stream [.slo-observability.health-v3.6] with write index [.ds-.slo-observability.health-v3.6-2026.08.10-000001], backing indices [], and aliases []", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateDataStreamService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.854Z","log.level": "INFO","message":"adding index template [.kibana_streams] for index patterns [.kibana_streams-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.856Z","log.level": "INFO","message":"adding component template [.edr-workflow-insights-component-template]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.887Z","log.level": "INFO","message":"moving index [.internal.alerts-default.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.888Z","log.level": "INFO","message":"moving index [.internal.alerts-transform.health.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.888Z","log.level": "INFO","message":"moving index [.internal.alerts-ml.anomaly-detection.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.888Z","log.level": "INFO","message":"moving index [.internal.alerts-streams.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.888Z","log.level": "INFO","message":"moving index [.internal.alerts-security.attack.discovery.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.889Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.metrics.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.889Z","log.level": "INFO","message":"moving index [.internal.alerts-security.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.889Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.slo.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.889Z","log.level": "INFO","message":"moving index [.internal.alerts-stack.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.890Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.uptime.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.890Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.threshold.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.890Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.logs.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.891Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.apm.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.891Z","log.level": "INFO","message":"moving index [.internal.alerts-dataset.quality.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.891Z","log.level": "INFO","message":"moving index [.internal.alerts-ml.anomaly-detection-health.alerts-default-000001] from [null] to [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.892Z","log.level": "INFO","message":"adding index template [.edr-workflow-insights-index-template] for index patterns [.edr-workflow-insights-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#20]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.939Z","log.level": "INFO","message":"adding index template [.edr-workflow-insights-index-template] for index patterns [.edr-workflow-insights-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.974Z","log.level": "INFO","message":"creating index [.kibana_streams-000001] in project [default], cause [api], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:18.974Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.kibana_streams-000001]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.023Z","log.level": "INFO","message":"creating index [.ds-.edr-workflow-insights-default-2026.08.10-000001] in project [default], cause [initialize_data_stream], templates [provided in request], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.024Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.ds-.edr-workflow-insights-default-2026.08.10-000001]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.024Z","log.level": "INFO","message":"adding data stream [.edr-workflow-insights-default] with write index [.ds-.edr-workflow-insights-default-2026.08.10-000001], backing indices [], and aliases []", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateDataStreamService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.133Z","log.level": "INFO","message":"moving index [.internal.alerts-streams.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.133Z","log.level": "INFO","message":"moving index [.internal.alerts-security.attack.discovery.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.133Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.metrics.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.133Z","log.level": "INFO","message":"moving index [.internal.alerts-security.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.133Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.slo.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.133Z","log.level": "INFO","message":"moving index [.internal.alerts-transform.health.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.133Z","log.level": "INFO","message":"moving index [.internal.alerts-ml.anomaly-detection.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.133Z","log.level": "INFO","message":"moving index [.internal.alerts-stack.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.133Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.uptime.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.134Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.threshold.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.134Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.logs.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.134Z","log.level": "INFO","message":"moving index [.internal.alerts-default.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.134Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.apm.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.134Z","log.level": "INFO","message":"moving index [.internal.alerts-dataset.quality.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.134Z","log.level": "INFO","message":"moving index [.internal.alerts-ml.anomaly-detection-health.alerts-default-000001] from [{\"phase\":\"new\",\"action\":\"complete\",\"name\":\"complete\"}] to [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.207Z","log.level": "INFO","message":"moving index [.internal.alerts-streams.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.207Z","log.level": "INFO","message":"moving index [.internal.alerts-security.attack.discovery.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.208Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.metrics.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.208Z","log.level": "INFO","message":"moving index [.internal.alerts-security.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.208Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.slo.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.208Z","log.level": "INFO","message":"moving index [.internal.alerts-transform.health.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.208Z","log.level": "INFO","message":"moving index [.internal.alerts-ml.anomaly-detection.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.209Z","log.level": "INFO","message":"moving index [.internal.alerts-stack.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.209Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.uptime.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.209Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.threshold.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.209Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.logs.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.209Z","log.level": "INFO","message":"moving index [.internal.alerts-default.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.210Z","log.level": "INFO","message":"moving index [.internal.alerts-observability.apm.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.214Z","log.level": "INFO","message":"moving index [.internal.alerts-dataset.quality.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.214Z","log.level": "INFO","message":"moving index [.internal.alerts-ml.anomaly-detection-health.alerts-default-000001] from [{\"phase\":\"hot\",\"action\":\"unfollow\",\"name\":\"branch-check-unfollow-prerequisites\"}] to [{\"phase\":\"hot\",\"action\":\"rollover\",\"name\":\"check-rollover-ready\"}] in policy [.alerts-ilm-policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.IndexLifecycleTransition","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.830Z","log.level": "INFO","message":"adding component template [.fleet_agent_id_verification-1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"f819e60e2b5931aed9f65a10263a0ca9","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.864Z","log.level": "INFO","message":"adding component template [.fleet_globals-1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"f819e60e2b5931aed9f65a10263a0ca9","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.865Z","log.level": "INFO","message":"adding component template [.fleet_event_ingested-1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"f819e60e2b5931aed9f65a10263a0ca9","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.994Z","log.level": "INFO","message":"creating index [.secrets-inference] in project [default], cause [auto(bulk api)], templates [], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.997Z","log.level": "INFO","message":"creating index [.inference] in project [default], cause [auto(bulk api)], templates [], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:19.997Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.secrets-inference, .inference]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:21.430Z","log.level": "INFO","message":"[.ds-.logs-elasticsearch.deprecation-default-2026.08.10-000001/H4dZhqALTYKsTPcjkD13tA] update_mapping [_doc]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataMappingService","trace.id":"a2f2c985bcfde7ba9c060dbad9f4549c","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:23.879Z","log.level": "INFO","message":"adding index lifecycle policy [synthetics-synthetics.icmp-default_policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:23.879Z","log.level": "INFO","message":"adding index lifecycle policy [synthetics-synthetics.tcp-default_policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:23.879Z","log.level": "INFO","message":"adding index lifecycle policy [synthetics-synthetics.browser_screenshot-default_policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:23.914Z","log.level": "INFO","message":"adding index lifecycle policy [synthetics-synthetics.browser-default_policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:23.914Z","log.level": "INFO","message":"adding index lifecycle policy [synthetics-synthetics.browser_network-default_policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:23.914Z","log.level": "INFO","message":"adding index lifecycle policy [synthetics-synthetics.http-default_policy]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.xpack.ilm.PutLifecycleMetadataService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.303Z","log.level": "INFO","message":"adding component template [synthetics-browser.screenshot@package]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.339Z","log.level": "INFO","message":"adding component template [synthetics-browser.network@package]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.349Z","log.level": "INFO","message":"adding component template [synthetics-browser@package]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.353Z","log.level": "INFO","message":"adding component template [synthetics-tcp@package]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.358Z","log.level": "INFO","message":"adding component template [synthetics-icmp@package]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.396Z","log.level": "INFO","message":"adding component template [synthetics-http@package]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.403Z","log.level": "INFO","message":"adding index template [synthetics-browser.screenshot] for index patterns [synthetics-browser.screenshot-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"f819e60e2b5931aed9f65a10263a0ca9","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.448Z","log.level": "INFO","message":"adding index template [synthetics-browser] for index patterns [synthetics-browser-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.455Z","log.level": "INFO","message":"adding index template [synthetics-browser.network] for index patterns [synthetics-browser.network-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"f819e60e2b5931aed9f65a10263a0ca9","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.468Z","log.level": "INFO","message":"adding index template [synthetics-icmp] for index patterns [synthetics-icmp-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.474Z","log.level": "INFO","message":"adding index template [synthetics-tcp] for index patterns [synthetics-tcp-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"3ece5d1d2b57f664a6d68c8bb9c25a1b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:09:24.526Z","log.level": "INFO","message":"adding index template [synthetics-http] for index patterns [synthetics-http-*]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#3]","log.logger":"org.elasticsearch.cluster.metadata.MetadataIndexTemplateService","trace.id":"f819e60e2b5931aed9f65a10263a0ca9","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:19:53.994Z","log.level": "INFO","message":"security index does not exist, creating [.security-profile-8] with alias [.security-profile] in project [default]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][transport_worker][T#7]","log.logger":"org.elasticsearch.xpack.security.support.SecurityIndexManager","trace.id":"5f222ae854569d26eb6cba6dcece2a4b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:19:54.011Z","log.level": "INFO","message":"creating index [.security-profile-8] in project [default], cause [api], templates [], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#6]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","trace.id":"5f222ae854569d26eb6cba6dcece2a4b","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:19:54.012Z","log.level": "INFO","message":"in project [default] updating number_of_replicas to [0] for indices [.security-profile-8]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#6]","log.logger":"org.elasticsearch.cluster.routing.allocation.AllocationService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:22:37.088Z","log.level": "INFO","message":"creating index [logstash-2026.08.10] in project [default], cause [auto(bulk api)], templates [], shards [1]/[1]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#7]","log.logger":"org.elasticsearch.cluster.metadata.MetadataCreateIndexService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:22:37.188Z","log.level": "INFO","message":"[logstash-2026.08.10/0zulyByqR1-A-_iYvPbQSA] create_mapping", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#7]","log.logger":"org.elasticsearch.cluster.metadata.MetadataMappingService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:22:37.222Z","log.level": "INFO","message":"[logstash-2026.08.10/0zulyByqR1-A-_iYvPbQSA] update_mapping [_doc]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#7]","log.logger":"org.elasticsearch.cluster.metadata.MetadataMappingService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:22:38.089Z","log.level": "INFO","message":"[logstash-2026.08.10/0zulyByqR1-A-_iYvPbQSA] update_mapping [_doc]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#7]","log.logger":"org.elasticsearch.cluster.metadata.MetadataMappingService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:22:50.086Z","log.level": "INFO","message":"[logstash-2026.08.10/0zulyByqR1-A-_iYvPbQSA] update_mapping [_doc]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#7]","log.logger":"org.elasticsearch.cluster.metadata.MetadataMappingService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:23:02.084Z","log.level": "INFO","message":"[logstash-2026.08.10/0zulyByqR1-A-_iYvPbQSA] update_mapping [_doc]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#7]","log.logger":"org.elasticsearch.cluster.metadata.MetadataMappingService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:23:23.086Z","log.level": "INFO","message":"[logstash-2026.08.10/0zulyByqR1-A-_iYvPbQSA] update_mapping [_doc]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#7]","log.logger":"org.elasticsearch.cluster.metadata.MetadataMappingService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+{"@timestamp":"2026-08-10T10:24:21.087Z","log.level": "INFO","message":"[logstash-2026.08.10/0zulyByqR1-A-_iYvPbQSA] update_mapping [_doc]", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","process.thread.name":"elasticsearch[logging-es-default-0][masterService#updateTask][T#7]","log.logger":"org.elasticsearch.cluster.metadata.MetadataMappingService","elasticsearch.cluster.uuid":"OiK2uNyeRdu302oMTdHLoA","elasticsearch.node.id":"dOnTolmJTgK1Tr02tDFMjQ","elasticsearch.node.name":"logging-es-default-0","elasticsearch.cluster.name":"logging"}
+
+i cant go inside fluentbit pod - no ssh option. I've tried efk stack from various sources to install - maybe lab setup is not proper 
