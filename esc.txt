@@ -1,2 +1,0 @@
-NAME      HEALTH   NODES   VERSION   PHASE   AGE
-logging   yellow   1       9.4.3     Ready   161m
