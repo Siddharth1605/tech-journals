@@ -1,4 +1,3 @@
-Yes. Given your current cluster, I would stop modifying the Fluent Bit setup and build a clean ELK pipeline around the Elasticsearch/Kibana you already have.
 
 And I want to make one correction to my earlier recommendation: for Kubernetes, the clean architecture is Filebeat → Logstash → Elasticsearch → Kibana, not Logstash directly tailing every node's files. Elastic's Kubernetes guidance uses Filebeat as a DaemonSet because it runs on each node and reads /var/log/containers; Logstash then receives Beats events on port 5044. 
 
