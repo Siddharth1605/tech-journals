@@ -1,7 +1,7 @@
 
 And I want to make one correction to my earlier recommendation: for Kubernetes, the clean architecture is Filebeat → Logstash → Elasticsearch → Kibana, not Logstash directly tailing every node's files. Elastic's Kubernetes guidance uses Filebeat as a DaemonSet because it runs on each node and reads /var/log/containers; Logstash then receives Beats events on port 5044. 
 
-Your Elasticsearch is already 9.4.3, so we'll keep everything on 9.4.3 rather than mixing versions. Elastic publishes both Filebeat and Logstash 9.4.3 images. 
+Your Elasticsearch is already 9.4.3, so we'll keep everything on 9.4.3 rather than mixing versions. Elastic publishes both Filebeat and Logstash 9.4.3 images
 
 
 ---
