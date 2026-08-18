@@ -57,3 +57,41 @@ Q7. Difference between @Controller and @RestController?
 
 > @Controller is typically used for Spring MVC controllers that may return views. @RestController combines @Controller with @ResponseBody, so return values are written directly to the response body, which is convenient for REST APIs.
 
+
+Global Exception Handler : 
+Q1. Why do we need global exception handling?
+
+Instead of repeating try-catch blocks in every controller method, we can centralize exception handling using @RestControllerAdvice and @ExceptionHandler. This keeps controllers clean and allows us to return a consistent error response format across the application.
+
+Q2. What is @ExceptionHandler?
+
+@ExceptionHandler tells Spring which controller method should handle a particular exception type. It can be used inside a controller for local handling or inside @ControllerAdvice/@RestControllerAdvice for centralized handling.
+
+Q3. What is @RestControllerAdvice?
+
+@RestControllerAdvice provides centralized exception handling for REST controllers and includes @ResponseBody behavior, so returned error objects are serialized directly into the HTTP response body.
+
+Q4. Difference between @ControllerAdvice and @RestControllerAdvice?
+
+@RestControllerAdvice is effectively @ControllerAdvice combined with @ResponseBody. It is convenient for REST APIs because handler return values are written directly to the response body.
+
+Q5. How do you handle multiple exception types with one handler?
+
+Use multiple exception classes in @ExceptionHandler, for example @ExceptionHandler({TypeA.class, TypeB.class}), or handle a common parent exception when the same handling behavior is appropriate.
+
+Q6. Why create custom exceptions?
+
+Custom exceptions allow us to represent meaningful business failures, such as UserNotFoundException or OrderNotFoundException, and map them to appropriate HTTP responses through the global exception handler.
+
+Q7. Should the service return ResponseEntity when an exception occurs?
+
+Generally no. The service layer should focus on business logic and can throw a meaningful exception. The web/controller layer can translate that exception into an HTTP status and response through global exception handling.
+
+Q8. Should we return the raw exception message to the client?
+
+Not for unexpected or internal exceptions. We should log the detailed exception server-side and return a safe, generic error message to the client to avoid exposing internal implementation or sensitive information.
+
+Q9. What happens if no @ExceptionHandler handles an exception?
+
+If the exception isn't handled by an application-specific handler, Spring's exception resolution mechanisms can handle it using its built-in/default handling. For production APIs, we generally define appropriate handlers for expected application errors and often have a final generic handler for unexpected failures.
+
