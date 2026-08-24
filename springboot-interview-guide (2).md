@@ -9,7 +9,7 @@
 ## 1. IoC & Dependency Injection
 
 **What it is:**
-- Normally, your class creates its own dependencies (`new UserService()`). That's tight coupling.
+- Normally, your class creates its own dependencies (`new UserService()`). Thats tight coupling.
 - **Inversion of Control (IoC):** you stop creating objects yourself — a container (Spring) does it for you and hands them to you.
 - **Dependency Injection (DI):** the *mechanism* IoC uses — the container "injects" the required objects into your class instead of your class instantiating them.
 - The container that does this is the **ApplicationContext** (built on `BeanFactory`).
