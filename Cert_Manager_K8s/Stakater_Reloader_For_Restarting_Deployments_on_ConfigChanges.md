@@ -12,7 +12,6 @@ Jetty loads renewed keystore.p12
         ↓
 HTTPS works again
 ```
-
 The next step is to automate that restart using **Stakater Reloader**.
 
 ## Why Reloader?
